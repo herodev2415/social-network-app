@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   File as FileIcon,
@@ -46,6 +46,22 @@ type ConversationItem = {
   updated_at: string | null;
   other: ProfileMini | null;
   unread_count: number;
+  last_message_content?: string | null;
+  last_message_created_at?: string | null;
+  last_message_media_type?: string | null;
+};
+
+type ConversationRpcRow = {
+  id: string;
+  updated_at: string | null;
+  other_id: string | null;
+  other_username: string | null;
+  other_full_name: string | null;
+  other_avatar_url: string | null;
+  unread_count: number | string | null;
+  last_message_content: string | null;
+  last_message_created_at: string | null;
+  last_message_media_type: string | null;
 };
 
 const MESSAGE_SELECT =
@@ -84,6 +100,13 @@ function makeTempMessage(params: {
   };
 }
 
+function sortMessages(messages: Message[]) {
+  return [...messages].sort(
+    (a, b) =>
+      new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+  );
+}
+
 export default function MessagesPage() {
   const { user } = useAuth();
   const [searchParams] = useSearchParams();
@@ -92,9 +115,7 @@ export default function MessagesPage() {
 
   const [conversationId, setConversationId] = useState("");
   const [conversations, setConversations] = useState<ConversationItem[]>([]);
-  const [selectedProfile, setSelectedProfile] = useState<ProfileMini | null>(
-    null
-  );
+  const [selectedProfile, setSelectedProfile] = useState<ProfileMini | null>(null);
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [content, setContent] = useState("");
@@ -110,37 +131,74 @@ export default function MessagesPage() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+  const loadingConversationsRef = useRef(false);
+
+  const conversationCacheKey = useMemo(() => {
+    return user ? `social-connect-conversations-${user.id}` : "";
+  }, [user?.id]);
 
   const selectedName =
     selectedProfile?.full_name ||
     selectedProfile?.username ||
     "Conversation";
 
-  function scrollToBottom() {
+  function scrollToBottom(behavior: ScrollBehavior = "auto") {
     requestAnimationFrame(() => {
-      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+      messagesEndRef.current?.scrollIntoView({ behavior });
     });
   }
 
   function mergeMessage(nextMessage: Message) {
     setMessages((previousMessages) => {
-      const exists = previousMessages.some(
-        (message) => message.id === nextMessage.id
+      const withoutDuplicate = previousMessages.filter(
+        (message) => message.id !== nextMessage.id
       );
 
-      if (exists) {
-        return previousMessages.map((message) =>
-          message.id === nextMessage.id ? nextMessage : message
-        );
-      }
-
-      return [...previousMessages, nextMessage].sort(
-        (a, b) =>
-          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
-      );
+      return sortMessages([...withoutDuplicate, nextMessage]);
     });
 
-    scrollToBottom();
+    scrollToBottom("smooth");
+  }
+
+  function replaceTempMessage(tempId: string, savedMessage: Message) {
+    setMessages((previousMessages) => {
+      const withoutTempAndDuplicate = previousMessages.filter(
+        (message) => message.id !== tempId && message.id !== savedMessage.id
+      );
+
+      return sortMessages([...withoutTempAndDuplicate, savedMessage]);
+    });
+
+    scrollToBottom("smooth");
+  }
+
+  function updateConversationPreview(params: {
+    targetConversationId: string;
+    content: string;
+    mediaType: string | null;
+    createdAt?: string;
+  }) {
+    const updatedAt = params.createdAt ?? new Date().toISOString();
+
+    setConversations((previousConversations) =>
+      previousConversations
+        .map((conversation) =>
+          conversation.id === params.targetConversationId
+            ? {
+                ...conversation,
+                updated_at: updatedAt,
+                last_message_content: params.content,
+                last_message_created_at: updatedAt,
+                last_message_media_type: params.mediaType,
+              }
+            : conversation
+        )
+        .sort(
+          (a, b) =>
+            new Date(b.updated_at ?? 0).getTime() -
+            new Date(a.updated_at ?? 0).getTime()
+        )
+    );
   }
 
   async function getProfileById(profileId: string) {
@@ -159,170 +217,51 @@ export default function MessagesPage() {
   }
 
   const loadConversations = useCallback(async () => {
-    if (!user || loadingConversations) return;
+    if (!user || loadingConversationsRef.current) return;
 
+    loadingConversationsRef.current = true;
     setLoadingConversations(true);
 
-    const { data: myParticipants, error: participantError } = await supabase
-      .from("conversation_participants")
-      .select("conversation_id")
-      .eq("user_id", user.id);
-
-    if (participantError) {
-      setLoadingConversations(false);
-      toast.error(participantError.message);
-      return;
-    }
-
-    const conversationIds = [
-      ...new Set(
-        (myParticipants ?? []).map((item) => String(item.conversation_id))
-      ),
-    ];
-
-    if (conversationIds.length === 0) {
-      setConversations([]);
-      setLoadingConversations(false);
-      return;
-    }
-
-    const [
-      conversationResult,
-      otherParticipantsResult,
-      unreadMessagesResult,
-    ] = await Promise.all([
-      supabase
-        .from("conversations")
-        .select("id, updated_at, created_at")
-        .in("id", conversationIds)
-        .order("updated_at", { ascending: false }),
-
-      supabase
-        .from("conversation_participants")
-        .select("conversation_id, user_id")
-        .in("conversation_id", conversationIds)
-        .neq("user_id", user.id),
-
-      supabase
-        .from("messages")
-        .select("conversation_id")
-        .in("conversation_id", conversationIds)
-        .neq("sender_id", user.id)
-        .eq("is_read", false),
-    ]);
-
-    if (conversationResult.error) {
-      setLoadingConversations(false);
-      toast.error(conversationResult.error.message);
-      return;
-    }
-
-    if (otherParticipantsResult.error) {
-      setLoadingConversations(false);
-      toast.error(otherParticipantsResult.error.message);
-      return;
-    }
-
-    if (unreadMessagesResult.error) {
-      console.error(
-        "Erreur messages non lus :",
-        unreadMessagesResult.error.message
-      );
-    }
-
-    const otherParticipants = otherParticipantsResult.data ?? [];
-    const otherUserIds = [
-      ...new Set(otherParticipants.map((item) => String(item.user_id))),
-    ];
-
-    let profiles: ProfileMini[] = [];
-
-    if (otherUserIds.length > 0) {
-      const { data: profileData, error: profileError } = await supabase
-        .from("profiles")
-        .select("id, username, full_name, avatar_url")
-        .in("id", otherUserIds);
-
-      if (profileError) {
-        setLoadingConversations(false);
-        toast.error(profileError.message);
-        return;
-      }
-
-      profiles = ((profileData ?? []) as unknown) as ProfileMini[];
-    }
-
-    const unreadByConversation: Record<string, number> = {};
-
-    for (const message of unreadMessagesResult.data ?? []) {
-      const id = String(message.conversation_id);
-      unreadByConversation[id] = (unreadByConversation[id] ?? 0) + 1;
-    }
-
-    const rawConversations: ConversationItem[] = (
-      conversationResult.data ?? []
-    ).map((conversation) => {
-      const otherParticipant = otherParticipants.find(
-        (item) => item.conversation_id === conversation.id
-      );
-
-      const otherProfile =
-        profiles.find((profile) => profile.id === otherParticipant?.user_id) ??
-        null;
-
-      return {
-        id: String(conversation.id),
-        updated_at:
-          String(conversation.updated_at || conversation.created_at) || null,
-        other: otherProfile,
-        unread_count: unreadByConversation[String(conversation.id)] ?? 0,
-      };
+    const { data, error } = await supabase.rpc("get_my_conversations", {
+      p_limit: 50,
     });
 
-    const uniqueByPerson = new Map<string, ConversationItem>();
+    loadingConversationsRef.current = false;
+    setLoadingConversations(false);
 
-    for (const conversation of rawConversations) {
-      const key = conversation.other?.id || conversation.id;
-      const existing = uniqueByPerson.get(key);
-
-      if (!existing) {
-        uniqueByPerson.set(key, conversation);
-        continue;
-      }
-
-      const existingDate = existing.updated_at
-        ? new Date(existing.updated_at).getTime()
-        : 0;
-
-      const currentDate = conversation.updated_at
-        ? new Date(conversation.updated_at).getTime()
-        : 0;
-
-      if (currentDate > existingDate) {
-        uniqueByPerson.set(key, {
-          ...conversation,
-          unread_count:
-            conversation.unread_count + (existing.unread_count ?? 0),
-        });
-      } else {
-        uniqueByPerson.set(key, {
-          ...existing,
-          unread_count:
-            existing.unread_count + (conversation.unread_count ?? 0),
-        });
-      }
+    if (error) {
+      toast.error(error.message);
+      return;
     }
 
-    setConversations(
-      Array.from(uniqueByPerson.values()).sort(
-        (a, b) =>
-          new Date(b.updated_at ?? 0).getTime() -
-          new Date(a.updated_at ?? 0).getTime()
-      )
-    );
+    const rows = ((data ?? []) as unknown) as ConversationRpcRow[];
 
-    setLoadingConversations(false);
-  }, [user, loadingConversations]);
+    const nextConversations: ConversationItem[] = rows.map((row) => ({
+      id: String(row.id),
+      updated_at: row.updated_at,
+      other: row.other_id
+        ? {
+            id: row.other_id,
+            username: row.other_username,
+            full_name: row.other_full_name,
+            avatar_url: row.other_avatar_url,
+          }
+        : null,
+      unread_count: Number(row.unread_count ?? 0),
+      last_message_content: row.last_message_content,
+      last_message_created_at: row.last_message_created_at,
+      last_message_media_type: row.last_message_media_type,
+    }));
+
+    setConversations(nextConversations);
+
+    if (conversationCacheKey) {
+      localStorage.setItem(
+        conversationCacheKey,
+        JSON.stringify(nextConversations)
+      );
+    }
+  }, [user?.id, conversationCacheKey]);
 
   const loadMessages = useCallback(async () => {
     if (!conversationId || !user) {
@@ -349,7 +288,7 @@ export default function MessagesPage() {
     const nextMessages = (((data ?? []) as unknown) as Message[]).reverse();
 
     setMessages(nextMessages);
-    scrollToBottom();
+    scrollToBottom("auto");
 
     await supabase
       .from("messages")
@@ -364,7 +303,7 @@ export default function MessagesPage() {
           : conversation
       )
     );
-  }, [conversationId, user]);
+  }, [conversationId, user?.id]);
 
   async function openConversation(conversation: ConversationItem) {
     setConversationId(conversation.id);
@@ -377,7 +316,7 @@ export default function MessagesPage() {
     );
 
     if (user) {
-      await supabase
+      void supabase
         .from("messages")
         .update({ is_read: true })
         .eq("conversation_id", conversation.id)
@@ -433,13 +372,13 @@ export default function MessagesPage() {
 
         setConversationId(existingConversationId);
 
-        await supabase
+        void supabase
           .from("messages")
           .update({ is_read: true })
           .eq("conversation_id", existingConversationId)
           .neq("sender_id", user.id);
 
-        await loadConversations();
+        void loadConversations();
         return;
       }
     }
@@ -478,15 +417,21 @@ export default function MessagesPage() {
 
     setConversationId(newConversationId);
 
-    setConversations((previousConversations) => [
-      {
+    setConversations((previousConversations) => {
+      const nextConversation: ConversationItem = {
         id: newConversationId,
         updated_at: new Date().toISOString(),
         other: targetProfile,
         unread_count: 0,
-      },
-      ...previousConversations,
-    ]);
+        last_message_content: null,
+        last_message_created_at: null,
+        last_message_media_type: null,
+      };
+
+      return [nextConversation, ...previousConversations];
+    });
+
+    void loadConversations();
   }
 
   async function updateConversationTime(targetConversationId = conversationId) {
@@ -533,6 +478,12 @@ export default function MessagesPage() {
     setSending(true);
     setContent("");
     mergeMessage(tempMessage);
+    updateConversationPreview({
+      targetConversationId: conversationId,
+      content: messageContent,
+      mediaType: "text",
+      createdAt: tempMessage.created_at,
+    });
 
     const { data, error } = await supabase
       .from("messages")
@@ -559,15 +510,17 @@ export default function MessagesPage() {
 
     if (data) {
       const savedMessage = ((data as unknown) as Message);
+      replaceTempMessage(tempMessage.id, savedMessage);
 
-      setMessages((previousMessages) =>
-        previousMessages.map((message) =>
-          message.id === tempMessage.id ? savedMessage : message
-        )
-      );
+      updateConversationPreview({
+        targetConversationId: savedMessage.conversation_id,
+        content: savedMessage.content,
+        mediaType: savedMessage.media_type ?? "text",
+        createdAt: savedMessage.created_at,
+      });
     }
 
-    await updateConversationTime();
+    void updateConversationTime();
   }
 
   async function uploadAndSendFile(file: File) {
@@ -588,7 +541,7 @@ export default function MessagesPage() {
       .upload(path, file, {
         cacheControl: "31536000",
         upsert: false,
-        contentType: file.type,
+        contentType: file.type || "application/octet-stream",
       });
 
     if (uploadError) {
@@ -602,6 +555,7 @@ export default function MessagesPage() {
       .getPublicUrl(path);
 
     const mediaType = getMediaType(file);
+
     const messageContent =
       mediaType === "image"
         ? "Photo"
@@ -619,6 +573,13 @@ export default function MessagesPage() {
     });
 
     mergeMessage(tempMessage);
+
+    updateConversationPreview({
+      targetConversationId: conversationId,
+      content: messageContent,
+      mediaType,
+      createdAt: tempMessage.created_at,
+    });
 
     const { data, error: insertError } = await supabase
       .from("messages")
@@ -646,15 +607,17 @@ export default function MessagesPage() {
 
     if (data) {
       const savedMessage = ((data as unknown) as Message);
+      replaceTempMessage(tempMessage.id, savedMessage);
 
-      setMessages((previousMessages) =>
-        previousMessages.map((message) =>
-          message.id === tempMessage.id ? savedMessage : message
-        )
-      );
+      updateConversationPreview({
+        targetConversationId: savedMessage.conversation_id,
+        content: savedMessage.content,
+        mediaType: savedMessage.media_type ?? mediaType,
+        createdAt: savedMessage.created_at,
+      });
     }
 
-    await updateConversationTime();
+    void updateConversationTime();
   }
 
   async function startRecording() {
@@ -749,6 +712,45 @@ export default function MessagesPage() {
     );
   }
 
+  function getConversationPreview(conversation: ConversationItem) {
+    if (conversation.last_message_media_type === "image") {
+      return "📷 Photo";
+    }
+
+    if (conversation.last_message_media_type === "audio") {
+      return "🎤 Message vocal";
+    }
+
+    if (conversation.last_message_media_type === "file") {
+      return "📎 Fichier";
+    }
+
+    if (conversation.last_message_content) {
+      return conversation.last_message_content;
+    }
+
+    if (conversation.updated_at) {
+      return timeAgo(conversation.updated_at);
+    }
+
+    return "Conversation";
+  }
+
+  useEffect(() => {
+    if (!conversationCacheKey) return;
+
+    try {
+      const cachedConversations = localStorage.getItem(conversationCacheKey);
+
+      if (cachedConversations) {
+        const parsed = JSON.parse(cachedConversations) as ConversationItem[];
+        setConversations(parsed);
+      }
+    } catch {
+      localStorage.removeItem(conversationCacheKey);
+    }
+  }, [conversationCacheKey]);
+
   useEffect(() => {
     void loadConversations();
   }, [loadConversations]);
@@ -782,14 +784,19 @@ export default function MessagesPage() {
 
           mergeMessage(newMessage);
 
+          updateConversationPreview({
+            targetConversationId: newMessage.conversation_id,
+            content: newMessage.content,
+            mediaType: newMessage.media_type ?? "text",
+            createdAt: newMessage.created_at,
+          });
+
           if (newMessage.sender_id !== user.id) {
             await supabase
               .from("messages")
               .update({ is_read: true })
               .eq("id", newMessage.id);
           }
-
-          void updateConversationTime(newMessage.conversation_id);
         }
       )
       .on(
@@ -810,24 +817,6 @@ export default function MessagesPage() {
           );
         }
       )
-      .on(
-        "postgres_changes",
-        {
-          event: "DELETE",
-          schema: "public",
-          table: "messages",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const deletedMessage = payload.old as Message;
-
-          setMessages((previousMessages) =>
-            previousMessages.filter(
-              (message) => message.id !== deletedMessage.id
-            )
-          );
-        }
-      )
       .subscribe();
 
     return () => {
@@ -839,22 +828,6 @@ export default function MessagesPage() {
   useEffect(() => {
     if (!user) return;
 
-    const channel = supabase
-      .channel(`conversation-participants-${user.id}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "*",
-          schema: "public",
-          table: "conversation_participants",
-          filter: `user_id=eq.${user.id}`,
-        },
-        () => {
-          void loadConversations();
-        }
-      )
-      .subscribe();
-
     const refreshOnFocus = () => {
       void loadConversations();
     };
@@ -863,12 +836,17 @@ export default function MessagesPage() {
 
     return () => {
       window.removeEventListener("focus", refreshOnFocus);
-      void supabase.removeChannel(channel);
     };
-  }, [user, loadConversations]);
+  }, [user?.id, loadConversations]);
 
   useEffect(() => {
-    scrollToBottom();
+    if (conversationCacheKey && conversations.length > 0) {
+      localStorage.setItem(conversationCacheKey, JSON.stringify(conversations));
+    }
+  }, [conversationCacheKey, conversations]);
+
+  useEffect(() => {
+    scrollToBottom("auto");
   }, [messages.length]);
 
   useEffect(() => {
@@ -885,7 +863,7 @@ export default function MessagesPage() {
 
           {loadingConversations && (
             <span className="text-[11px] text-muted-foreground">
-              Chargement...
+              Synchronisation...
             </span>
           )}
         </div>
@@ -917,10 +895,8 @@ export default function MessagesPage() {
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-semibold">{otherName}</p>
 
-                  <p className="text-xs text-muted-foreground">
-                    {conversation.updated_at
-                      ? timeAgo(conversation.updated_at)
-                      : "Conversation"}
+                  <p className="truncate text-xs text-muted-foreground">
+                    {getConversationPreview(conversation)}
                   </p>
                 </div>
 
@@ -1027,9 +1003,7 @@ export default function MessagesPage() {
               return (
                 <div
                   key={message.id}
-                  className={`flex ${
-                    isMine ? "justify-end" : "justify-start"
-                  }`}
+                  className={`flex ${isMine ? "justify-end" : "justify-start"}`}
                 >
                   <div
                     className={`max-w-[78%] rounded-2xl px-4 py-2 text-sm ${

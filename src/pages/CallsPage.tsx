@@ -13,7 +13,13 @@ export default function CallsPage() {
 
   useEffect(() => {
     if (!user) return;
-    supabase.from("calls").select("*").or(`caller_id.eq.${user.id},receiver_id.eq.${user.id}`).order("created_at", { ascending: false }).then(({ data }) => setItems((data as Call[]) ?? []));
+    supabase
+  .from("calls")
+  .select("id, caller_id, receiver_id, call_type, status, duration, created_at")
+  .or(`caller_id.eq.${user.id},receiver_id.eq.${user.id}`)
+  .order("created_at", { ascending: false })
+  .limit(50)
+  .then(({ data }) => setItems((data as Call[]) ?? []));
   }, [user?.id]);
 
   return (

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { supabase } from "@/db/supabase";
@@ -11,7 +11,7 @@ type ReactionPickerProps = {
   targetId: string;
   userId?: string | null;
   compact?: boolean;
-  onChanged?: () => void;
+  onChanged?: () => void | Promise<void>;
 };
 
 const REACTIONS: {
@@ -27,6 +27,10 @@ const REACTIONS: {
   { type: "angry", emoji: "😡", label: "Grrr" },
 ];
 
+function isReactionType(value: string): value is ReactionType {
+  return REACTIONS.some((reaction) => reaction.type === value);
+}
+
 export function ReactionPicker({
   targetType,
   targetId,
@@ -36,9 +40,14 @@ export function ReactionPicker({
 }: ReactionPickerProps) {
   const [open, setOpen] = useState(false);
   const [myReaction, setMyReaction] = useState<ReactionType | null>(null);
-  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [counts, setCounts] = useState<Partial<Record<ReactionType, number>>>(
+    {}
+  );
+  const [reacting, setReacting] = useState(false);
 
-  const table = targetType === "post" ? "post_reactions" : "comment_reactions";
+  const table =
+    targetType === "post" ? "post_reactions" : "comment_reactions";
+
   const idColumn = targetType === "post" ? "post_id" : "comment_id";
 
   const selectedReaction = useMemo(
@@ -46,9 +55,12 @@ export function ReactionPicker({
     [myReaction]
   );
 
-  const total = Object.values(counts).reduce((sum, value) => sum + value, 0);
+  const total = Object.values(counts).reduce(
+    (sum, value) => sum + (value ?? 0),
+    0
+  );
 
-  async function loadReactions() {
+  const loadReactions = useCallback(async () => {
     if (!targetId) return;
 
     const { data, error } = await supabase
@@ -61,11 +73,13 @@ export function ReactionPicker({
       return;
     }
 
-    const nextCounts: Record<string, number> = {};
+    const nextCounts: Partial<Record<ReactionType, number>> = {};
     let nextMyReaction: ReactionType | null = null;
 
     for (const row of data ?? []) {
-      const type = row.reaction_type as ReactionType;
+      const type = String(row.reaction_type);
+
+      if (!isReactionType(type)) continue;
 
       nextCounts[type] = (nextCounts[type] ?? 0) + 1;
 
@@ -76,6 +90,34 @@ export function ReactionPicker({
 
     setCounts(nextCounts);
     setMyReaction(nextMyReaction);
+  }, [idColumn, table, targetId, userId]);
+
+  function applyLocalReaction(
+    previousReaction: ReactionType | null,
+    nextReaction: ReactionType | null
+  ) {
+    setCounts((previousCounts) => {
+      const nextCounts = { ...previousCounts };
+
+      if (previousReaction) {
+        nextCounts[previousReaction] = Math.max(
+          0,
+          (nextCounts[previousReaction] ?? 0) - 1
+        );
+
+        if (nextCounts[previousReaction] === 0) {
+          delete nextCounts[previousReaction];
+        }
+      }
+
+      if (nextReaction) {
+        nextCounts[nextReaction] = (nextCounts[nextReaction] ?? 0) + 1;
+      }
+
+      return nextCounts;
+    });
+
+    setMyReaction(nextReaction);
   }
 
   async function react(reactionType: ReactionType) {
@@ -84,23 +126,37 @@ export function ReactionPicker({
       return;
     }
 
-    if (myReaction === reactionType) {
+    if (reacting) return;
+
+    const previousReaction = myReaction;
+    const previousCounts = counts;
+
+    setReacting(true);
+    setOpen(false);
+
+    if (previousReaction === reactionType) {
+      applyLocalReaction(previousReaction, null);
+
       const { error } = await supabase
         .from(table)
         .delete()
         .eq(idColumn, targetId)
         .eq("user_id", userId);
 
+      setReacting(false);
+
       if (error) {
+        setMyReaction(previousReaction);
+        setCounts(previousCounts);
         toast.error(error.message);
         return;
       }
 
-      setMyReaction(null);
-      await loadReactions();
-      onChanged?.();
+      await onChanged?.();
       return;
     }
+
+    applyLocalReaction(previousReaction, reactionType);
 
     const payload =
       targetType === "post"
@@ -119,36 +175,38 @@ export function ReactionPicker({
       onConflict: `${idColumn},user_id`,
     });
 
+    setReacting(false);
+
     if (error) {
+      setMyReaction(previousReaction);
+      setCounts(previousCounts);
       toast.error(error.message);
       return;
     }
 
-    setMyReaction(reactionType);
-    setOpen(false);
-
-    await loadReactions();
-    onChanged?.();
+    await onChanged?.();
   }
 
   useEffect(() => {
-    loadReactions();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetId, userId]);
+    void loadReactions();
+  }, [loadReactions]);
 
   return (
     <div className="relative inline-flex items-center gap-2">
       <button
         type="button"
         onClick={() => setOpen((value) => !value)}
+        disabled={reacting}
         className={cn(
-          "inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-semibold transition hover:bg-accent",
+          "inline-flex items-center gap-2 rounded-xl px-3 py-2 text-sm font-semibold transition hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60",
           selectedReaction ? "text-primary" : "text-muted-foreground",
           compact && "px-2 py-1 text-xs"
         )}
       >
         <span>{selectedReaction?.emoji ?? "👍"}</span>
+
         {!compact && <span>{selectedReaction?.label ?? "Réagir"}</span>}
+
         {total > 0 && (
           <span className="text-xs text-muted-foreground">{total}</span>
         )}
@@ -162,8 +220,9 @@ export function ReactionPicker({
               type="button"
               title={reaction.label}
               onClick={() => react(reaction.type)}
+              disabled={reacting}
               className={cn(
-                "grid h-10 w-10 place-items-center rounded-full text-xl transition hover:scale-125 hover:bg-accent",
+                "grid h-10 w-10 place-items-center rounded-full text-xl transition hover:scale-125 hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60",
                 myReaction === reaction.type && "bg-primary/10"
               )}
             >

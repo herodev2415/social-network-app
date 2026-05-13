@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   MessageCircle,
@@ -19,55 +19,113 @@ import { ReactionPicker } from "@/components/ReactionPicker";
 
 import { timeAgo } from "@/lib/utils";
 
+type PostProfile = {
+  id?: string | null;
+  username?: string | null;
+  full_name?: string | null;
+  avatar_url?: string | null;
+};
+
+type PostItem = {
+  id: string;
+  user_id: string;
+  content?: string | null;
+  media_url?: string | null;
+  media_type?: "image" | "video" | "text" | string | null;
+  created_at: string;
+  comments_count?: number | null;
+  likes_count?: number | null;
+  liked_by_me?: boolean | null;
+  profiles?: PostProfile | null;
+};
+
 type PostCardProps = {
-  post: any;
-  onChange?: () => void;
+  post: PostItem;
+  onChange?: () => void | Promise<void>;
 };
 
 export function PostCard({ post, onChange }: PostCardProps) {
   const { user } = useAuth();
+
   const [commentsOpen, setCommentsOpen] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [isDeleted, setIsDeleted] = useState(false);
 
-  const authorId = post?.user_id || post?.profiles?.id || null;
+  const authorId = useMemo(() => {
+    return post?.profiles?.id || post?.user_id || null;
+  }, [post?.profiles?.id, post?.user_id]);
 
-  const authorName =
-    post?.profiles?.full_name ||
-    post?.profiles?.username ||
-    "Utilisateur";
+  const authorName = useMemo(() => {
+    return (
+      post?.profiles?.full_name ||
+      post?.profiles?.username ||
+      "Utilisateur"
+    );
+  }, [post?.profiles?.full_name, post?.profiles?.username]);
 
   const authorUsername = post?.profiles?.username || "profil";
 
+  const canDelete = Boolean(user?.id && post?.user_id && user.id === post.user_id);
+
   async function handleDelete() {
-    if (!user || user.id !== post.user_id) return;
+    if (!user || !canDelete || isDeleting) return;
 
     const confirmDelete = window.confirm("Supprimer cette publication ?");
     if (!confirmDelete) return;
+
+    setIsDeleting(true);
 
     const { error } = await supabase
       .from("posts")
       .delete()
       .eq("id", post.id);
 
+    setIsDeleting(false);
+
     if (error) {
       toast.error(error.message);
       return;
     }
 
+    setIsDeleted(true);
     toast.success("Publication supprimée.");
-    onChange?.();
+
+    await onChange?.();
   }
 
   async function handleShare() {
-    try {
-      const url = authorId
-        ? `${window.location.origin}/profile/${authorId}`
-        : window.location.href;
+  try {
+    const baseUrl = window.location.origin;
 
-      await navigator.clipboard.writeText(url);
-      toast.success("Lien copié.");
-    } catch {
-      toast.success("Publication prête à être partagée.");
-    }
+    const url = post.id
+      ? `${baseUrl}/post/${post.id}`
+      : authorId
+      ? `${baseUrl}/profile/${authorId}`
+      : baseUrl;
+
+    await navigator.clipboard.writeText(url);
+    toast.success("Lien copié.");
+  } catch {
+    toast.success("Publication prête à être partagée.");
+  }
+}
+
+  function handleCommentChanged() {
+    void onChange?.();
+  }
+
+  function handleReactionChanged() {
+    /**
+     * Important pour la performance :
+     * on ne force pas ici un rechargement complet du feed/profil.
+     * ReactionPicker doit gérer son propre état visuel.
+     * Si tu veux absolument recharger après réaction, remplace par :
+     * void onChange?.();
+     */
+  }
+
+  if (isDeleted) {
+    return null;
   }
 
   return (
@@ -76,14 +134,14 @@ export function PostCard({ post, onChange }: PostCardProps) {
         {authorId ? (
           <Link to={`/profile/${authorId}`}>
             <Avatar
-              src={post?.profiles?.avatar_url}
+              src={post?.profiles?.avatar_url || undefined}
               name={authorName}
               className="h-11 w-11"
             />
           </Link>
         ) : (
           <Avatar
-            src={post?.profiles?.avatar_url}
+            src={post?.profiles?.avatar_url || undefined}
             name={authorName}
             className="h-11 w-11"
           />
@@ -106,11 +164,12 @@ export function PostCard({ post, onChange }: PostCardProps) {
           </div>
         </div>
 
-        {user?.id === post.user_id ? (
+        {canDelete ? (
           <Button
             variant="ghost"
             size="icon"
             onClick={handleDelete}
+            disabled={isDeleting}
             title="Supprimer"
           >
             <Trash2 size={16} />
@@ -133,6 +192,8 @@ export function PostCard({ post, onChange }: PostCardProps) {
           <img
             src={post.media_url}
             alt="Publication"
+            loading="lazy"
+            decoding="async"
             className="max-h-[680px] w-full max-w-full object-contain"
           />
         </div>
@@ -143,6 +204,7 @@ export function PostCard({ post, onChange }: PostCardProps) {
           src={post.media_url}
           className="max-h-[680px] w-full bg-black object-contain"
           controls
+          preload="metadata"
         />
       )}
 
@@ -152,7 +214,7 @@ export function PostCard({ post, onChange }: PostCardProps) {
             targetType="post"
             targetId={post.id}
             userId={user?.id}
-            onChanged={onChange}
+            onChanged={handleReactionChanged}
           />
         </div>
 
@@ -179,7 +241,7 @@ export function PostCard({ post, onChange }: PostCardProps) {
 
       {commentsOpen && (
         <div className="border-t bg-muted/20 p-3">
-          <CommentSection postId={post.id} onChanged={onChange} />
+          <CommentSection postId={post.id} onChanged={handleCommentChanged} />
         </div>
       )}
     </Card>

@@ -4,7 +4,6 @@ import {
   Image,
   MapPin,
   MessageCircle,
-  UserCheck,
   UserPlus,
   Users,
   Globe,
@@ -17,7 +16,7 @@ import { toast } from "sonner";
 import { supabase } from "@/db/supabase";
 import { useAuth } from "@/contexts/AuthContext";
 
-import type { Post, Profile } from "@/types/types";
+import type { Profile } from "@/types/types";
 
 import { Avatar } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
@@ -42,6 +41,38 @@ type FriendshipRecord = {
   updated_at?: string;
 };
 
+type ProfileMini = {
+  id: string;
+  username: string | null;
+  full_name: string | null;
+  avatar_url: string | null;
+};
+
+type ProfilePost = {
+  id: string;
+  user_id: string;
+  content: string | null;
+  media_url: string | null;
+  media_type: string | null;
+  created_at: string;
+  comments_count?: number;
+  profiles?: ProfileMini | null;
+  [key: string]: unknown;
+};
+
+type PhotoPost = ProfilePost & {
+  media_url: string;
+  media_type: "image";
+};
+
+function isPhotoPost(post: ProfilePost): post is PhotoPost {
+  return (
+    post.media_type === "image" &&
+    typeof post.media_url === "string" &&
+    post.media_url.trim().length > 0
+  );
+}
+
 export default function ProfilePage() {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -50,9 +81,9 @@ export default function ProfilePage() {
   const userId = id === "me" ? user?.id : id;
 
   const [profile, setProfile] = useState<Profile | null>(null);
-  const [posts, setPosts] = useState<Post[]>([]);
+  const [posts, setPosts] = useState<ProfilePost[]>([]);
   const [friends, setFriends] = useState<FriendMini[]>([]);
-  const [photos, setPhotos] = useState<Post[]>([]);
+  const [photos, setPhotos] = useState<PhotoPost[]>([]);
 
   const [friendshipStatus, setFriendshipStatus] =
     useState<FriendshipStatus>("none");
@@ -67,45 +98,43 @@ export default function ProfilePage() {
   const [showAllPhotos, setShowAllPhotos] = useState(false);
   const [selectedPhoto, setSelectedPhoto] = useState<string | null>(null);
 
-  async function load() {
-    if (!userId || userId === "undefined" || userId === "null") {
-      setLoadingProfile(false);
-      setProfile(null);
-      return;
-    }
-
-    setLoadingProfile(true);
-
-    const { data: profileData, error: profileError } = await supabase
-      .from("profiles")
-      .select("*")
-      .eq("id", userId)
-      .maybeSingle();
-
-    if (profileError) {
-      setLoadingProfile(false);
-      toast.error(profileError.message);
-      return;
-    }
-
-    setProfile((profileData as Profile) ?? null);
-
+  async function loadPosts(targetUserId: string) {
     const { data: postsData, error: postsError } = await supabase
       .from("posts")
-      .select("*, profiles(*)")
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false });
+      .select(
+        `
+        id,
+        user_id,
+        content,
+        media_url,
+        media_type,
+        created_at,
+        profiles (
+          id,
+          username,
+          full_name,
+          avatar_url
+        )
+      `
+      )
+      .eq("user_id", targetUserId)
+      .order("created_at", { ascending: false })
+      .limit(20);
 
     if (postsError) {
-      setLoadingProfile(false);
       toast.error(postsError.message);
+      setPosts([]);
+      setPhotos([]);
       return;
     }
 
-    const rawPosts = (postsData as any[]) ?? [];
+    const rawPosts: ProfilePost[] = Array.isArray(postsData)
+      ? (postsData as unknown as ProfilePost[])
+      : [];
+
     const postIds = rawPosts.map((post) => post.id);
 
-    let commentsCountByPost: Record<string, number> = {};
+    const commentsCountByPost: Record<string, number> = {};
 
     if (postIds.length > 0) {
       const { data: commentsData, error: commentsError } = await supabase
@@ -120,28 +149,19 @@ export default function ProfilePage() {
         );
       } else {
         for (const comment of commentsData ?? []) {
-          commentsCountByPost[comment.post_id] =
-            (commentsCountByPost[comment.post_id] ?? 0) + 1;
+          const postId = String(comment.post_id);
+          commentsCountByPost[postId] = (commentsCountByPost[postId] ?? 0) + 1;
         }
       }
     }
 
-    const nextPosts = rawPosts.map((post) => ({
+    const nextPosts: ProfilePost[] = rawPosts.map((post) => ({
       ...post,
       comments_count: commentsCountByPost[post.id] ?? 0,
     }));
 
-    setPosts(nextPosts as Post[]);
-    setPhotos(
-      nextPosts.filter(
-        (post: any) => post.media_type === "image" && post.media_url
-      ) as Post[]
-    );
-
-    await loadFriendshipStatus(userId);
-    await loadFriends(userId);
-
-    setLoadingProfile(false);
+    setPosts(nextPosts);
+    setPhotos(nextPosts.filter(isPhotoPost));
   }
 
   async function loadFriends(targetUserId: string) {
@@ -167,7 +187,7 @@ export default function ProfilePage() {
 
     const { data, error } = await supabase
       .from("friendships")
-      .select("*")
+      .select("id, user_id, friend_id, status, created_at, updated_at")
       .or(
         `and(user_id.eq.${user.id},friend_id.eq.${targetUserId}),and(user_id.eq.${targetUserId},friend_id.eq.${user.id})`
       )
@@ -191,6 +211,43 @@ export default function ProfilePage() {
     setFriendshipStatus((data.status as FriendshipStatus) || "pending");
   }
 
+  async function load() {
+    if (!userId || userId === "undefined" || userId === "null") {
+      setLoadingProfile(false);
+      setProfile(null);
+      return;
+    }
+
+    setLoadingProfile(true);
+
+    const { data: profileData, error: profileError } = await supabase
+      .from("profiles")
+      .select("id, username, full_name, avatar_url, bio, location, website")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (profileError) {
+      setLoadingProfile(false);
+      toast.error(profileError.message);
+      return;
+    }
+
+    setProfile((profileData as Profile) ?? null);
+
+    await Promise.all([
+      loadPosts(userId),
+      loadFriendshipStatus(userId),
+      loadFriends(userId),
+    ]);
+
+    setLoadingProfile(false);
+  }
+
+  async function refreshPostsOnly() {
+    if (!userId) return;
+    await loadPosts(userId);
+  }
+
   async function addFriend() {
     if (!user || !userId) return;
 
@@ -203,7 +260,7 @@ export default function ProfilePage() {
 
     const { data: existingFriendship, error: checkError } = await supabase
       .from("friendships")
-      .select("*")
+      .select("id, user_id, friend_id, status, created_at, updated_at")
       .or(
         `and(user_id.eq.${user.id},friend_id.eq.${userId}),and(user_id.eq.${userId},friend_id.eq.${user.id})`
       )
@@ -243,7 +300,7 @@ export default function ProfilePage() {
             updated_at: new Date().toISOString(),
           })
           .eq("id", existing.id)
-          .select("*")
+          .select("id, user_id, friend_id, status, created_at, updated_at")
           .maybeSingle();
 
         if (updateError) {
@@ -281,7 +338,7 @@ export default function ProfilePage() {
         friend_id: userId,
         status: "pending",
       })
-      .select("*")
+      .select("id, user_id, friend_id, status, created_at, updated_at")
       .maybeSingle();
 
     if (error) {
@@ -339,13 +396,11 @@ export default function ProfilePage() {
     setFriendshipRecord(null);
     setFriendshipStatus("none");
 
-    await load();
-
     toast.success(wasAccepted ? "Ami retiré." : "Demande annulée.");
   }
 
   useEffect(() => {
-    load();
+    void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [userId, user?.id]);
 
@@ -370,10 +425,7 @@ export default function ProfilePage() {
       }
 
       return (
-        <Button
-          variant="secondary"
-          onClick={() => navigate("/notifications")}
-        >
+        <Button variant="secondary" onClick={() => navigate("/notifications")}>
           Répondre à la demande
         </Button>
       );
@@ -664,12 +716,14 @@ export default function ProfilePage() {
                   <button
                     key={photo.id}
                     type="button"
-                    onClick={() => setSelectedPhoto((photo as any).media_url)}
+                    onClick={() => setSelectedPhoto(photo.media_url)}
                     className="aspect-square overflow-hidden rounded-xl bg-muted transition hover:scale-[1.02]"
                   >
                     <img
-                      src={(photo as any).media_url || ""}
+                      src={photo.media_url}
                       alt="Photo"
+                      loading="lazy"
+                      decoding="async"
                       className="h-full w-full object-cover"
                     />
                   </button>
@@ -686,7 +740,7 @@ export default function ProfilePage() {
 
           <section id="publications" className="space-y-4">
             {posts.map((post) => (
-              <PostCard key={post.id} post={post} onChange={load} />
+              <PostCard key={post.id} post={post} onChange={refreshPostsOnly} />
             ))}
 
             {posts.length === 0 && (
@@ -711,6 +765,7 @@ export default function ProfilePage() {
           <img
             src={selectedPhoto}
             alt="Photo agrandie"
+            decoding="async"
             className="max-h-[90vh] max-w-[95vw] rounded-2xl object-contain"
           />
         </div>

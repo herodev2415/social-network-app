@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Plus,
   TrendingUp,
@@ -10,9 +11,11 @@ import {
   Newspaper,
   RefreshCcw,
 } from "lucide-react";
+
 import { supabase } from "@/db/supabase";
-import type { Post, Story } from "@/types/types";
+import type { Story } from "@/types/types";
 import { useAuth } from "@/contexts/AuthContext";
+
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { CreatePostForm } from "@/components/CreatePostForm";
@@ -20,12 +23,32 @@ import { PostCard } from "@/components/PostCard";
 import { StoryItem } from "@/components/StoryItem";
 import { Avatar } from "@/components/ui/avatar";
 
+const PAGE_SIZE = 10;
+
+type FeedPostProfile = {
+  id: string;
+  username: string | null;
+  full_name: string | null;
+  avatar_url: string | null;
+};
+
+type FeedPost = {
+  id: string;
+  user_id: string;
+  content: string | null;
+  media_url: string | null;
+  media_type: "image" | "video" | "text" | string | null;
+  created_at: string;
+  comments_count?: number;
+  profiles?: FeedPostProfile | null;
+};
+
 type NewsPost = {
   id: string;
   title: string;
   summary: string | null;
   source_name: string | null;
-  source_url: string;
+  source_url: string | null;
   image_url: string | null;
   category: string | null;
   published_at: string | null;
@@ -37,7 +60,7 @@ type FeedItem =
       type: "post";
       id: string;
       date: string;
-      post: Post;
+      post: FeedPost;
     }
   | {
       type: "news";
@@ -59,18 +82,34 @@ function formatDate(dateValue: string) {
 }
 
 export default function FeedPage() {
-  const { user, profile } = useAuth();
+  const { profile } = useAuth();
 
-  const [posts, setPosts] = useState<Post[]>([]);
+  const [posts, setPosts] = useState<FeedPost[]>([]);
   const [stories, setStories] = useState<Story[]>([]);
   const [newsPosts, setNewsPosts] = useState<NewsPost[]>([]);
-  const [limit, setLimit] = useState(10);
+  const [limit, setLimit] = useState(PAGE_SIZE);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
 
-  async function loadPosts() {
+  const loadPosts = useCallback(async () => {
     const { data, error } = await supabase
       .from("posts")
-      .select("*, profiles(*)")
+      .select(
+        `
+        id,
+        user_id,
+        content,
+        media_url,
+        media_type,
+        created_at,
+        profiles (
+          id,
+          username,
+          full_name,
+          avatar_url
+        )
+      `
+      )
       .order("created_at", { ascending: false })
       .limit(limit);
 
@@ -80,43 +119,40 @@ export default function FeedPage() {
       return;
     }
 
-    const enriched = await Promise.all(
-      ((data as Post[]) ?? []).map(async (p) => {
-        const [{ count: likes }, { count: comments }, { data: liked }] =
-          await Promise.all([
-            supabase
-              .from("likes")
-              .select("*", { count: "exact", head: true })
-              .eq("post_id", p.id),
+    const rawPosts = ((data ?? []) as unknown) as FeedPost[];
+    const postIds = rawPosts.map((post) => post.id);
 
-            supabase
-              .from("comments")
-              .select("*", { count: "exact", head: true })
-              .eq("post_id", p.id),
+    const commentsCountByPost: Record<string, number> = {};
 
-            user
-              ? supabase
-                  .from("likes")
-                  .select("id")
-                  .eq("post_id", p.id)
-                  .eq("user_id", user.id)
-                  .maybeSingle()
-              : Promise.resolve({ data: null }),
-          ]);
+    if (postIds.length > 0) {
+      const { data: commentsData, error: commentsError } = await supabase
+        .from("comments")
+        .select("post_id")
+        .in("post_id", postIds);
 
-        return {
-          ...p,
-          likes_count: likes ?? 0,
-          comments_count: comments ?? 0,
-          liked_by_me: !!liked,
-        };
-      })
-    );
+      if (commentsError) {
+        console.error(
+          "Erreur chargement commentaires :",
+          commentsError.message
+        );
+      } else {
+        for (const comment of commentsData ?? []) {
+          const postId = String(comment.post_id);
+          commentsCountByPost[postId] =
+            (commentsCountByPost[postId] ?? 0) + 1;
+        }
+      }
+    }
 
-    setPosts(enriched);
-  }
+    const postsWithCounts = rawPosts.map((post) => ({
+      ...post,
+      comments_count: commentsCountByPost[post.id] ?? 0,
+    }));
 
-  async function loadNewsPosts() {
+    setPosts(postsWithCounts);
+  }, [limit]);
+
+  const loadNewsPosts = useCallback(async () => {
     const { data, error } = await supabase
       .from("news_posts")
       .select(
@@ -132,7 +168,7 @@ export default function FeedPage() {
         created_at
       `
       )
-      .order("published_at", { ascending: false, nullsFirst: false })
+      .order("published_at", { ascending: false })
       .limit(limit);
 
     if (error) {
@@ -141,15 +177,31 @@ export default function FeedPage() {
       return;
     }
 
-    setNewsPosts((data as NewsPost[]) ?? []);
-  }
+    setNewsPosts(((data ?? []) as unknown) as NewsPost[]);
+  }, [limit]);
 
-  async function loadStories() {
+  const loadStories = useCallback(async () => {
     const { data, error } = await supabase
       .from("stories")
-      .select("*, profiles(*)")
+      .select(
+        `
+        id,
+        user_id,
+        media_url,
+        media_type,
+        created_at,
+        expires_at,
+        profiles (
+          id,
+          username,
+          full_name,
+          avatar_url
+        )
+      `
+      )
       .gt("expires_at", new Date().toISOString())
-      .order("created_at", { ascending: false });
+      .order("created_at", { ascending: false })
+      .limit(20);
 
     if (error) {
       console.error("Erreur chargement stories :", error.message);
@@ -157,53 +209,50 @@ export default function FeedPage() {
       return;
     }
 
-    setStories((data as Story[]) ?? []);
-  }
+    setStories(((data ?? []) as unknown) as Story[]);
+  }, []);
 
-  async function loadFeed() {
-    setLoading(true);
+  const loadFeed = useCallback(async () => {
+    setRefreshing(true);
 
     await Promise.all([loadPosts(), loadStories(), loadNewsPosts()]);
 
+    setRefreshing(false);
     setLoading(false);
-  }
+  }, [loadPosts, loadStories, loadNewsPosts]);
 
   useEffect(() => {
-    loadFeed();
+    void loadFeed();
 
-    const ch = supabase
+    const channel = supabase
       .channel("feed-realtime")
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "posts" },
-        loadFeed
-      )
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "likes" },
-        loadPosts
-      )
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "comments" },
-        loadPosts
+        () => {
+          void loadPosts();
+        }
       )
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "stories" },
-        loadStories
+        () => {
+          void loadStories();
+        }
       )
       .on(
         "postgres_changes",
         { event: "*", schema: "public", table: "news_posts" },
-        loadNewsPosts
+        () => {
+          void loadNewsPosts();
+        }
       )
       .subscribe();
 
     return () => {
-      supabase.removeChannel(ch);
+      void supabase.removeChannel(channel);
     };
-  }, [limit, user?.id]);
+  }, [loadFeed, loadPosts, loadStories, loadNewsPosts]);
 
   const feedItems = useMemo<FeedItem[]>(() => {
     const mappedPosts: FeedItem[] = posts.map((post) => ({
@@ -246,33 +295,33 @@ export default function FeedPage() {
           </div>
 
           <nav className="mt-4 space-y-1 text-sm">
-            <a
-              href="/profile/me"
+            <Link
+              to="/profile/me"
               className="flex items-center gap-3 rounded-2xl p-3 font-semibold hover:bg-accent"
             >
               <Users size={17} /> Mon profil
-            </a>
+            </Link>
 
-            <a
-              href="/groups"
+            <Link
+              to="/groups"
               className="flex items-center gap-3 rounded-2xl p-3 font-semibold hover:bg-accent"
             >
               <Sparkles size={17} /> Groupes
-            </a>
+            </Link>
 
-            <a
-              href="/messages"
+            <Link
+              to="/messages"
               className="flex items-center gap-3 rounded-2xl p-3 font-semibold hover:bg-accent"
             >
               <MessageCircle size={17} /> Messages
-            </a>
+            </Link>
 
-            <a
-              href="/settings"
+            <Link
+              to="/settings"
               className="flex items-center gap-3 rounded-2xl p-3 font-semibold hover:bg-accent"
             >
               <ShieldCheck size={17} /> Paramètres
-            </a>
+            </Link>
           </nav>
         </Card>
       </aside>
@@ -296,11 +345,11 @@ export default function FeedPage() {
                 variant="outline"
                 size="sm"
                 onClick={loadFeed}
-                disabled={loading}
+                disabled={refreshing}
                 className="hidden rounded-xl sm:inline-flex"
               >
                 <RefreshCcw className="mr-2 h-4 w-4" />
-                Actualiser
+                {refreshing ? "..." : "Actualiser"}
               </Button>
 
               <div className="icon-pill h-10 w-10">
@@ -310,20 +359,20 @@ export default function FeedPage() {
           </div>
 
           <div className="custom-scrollbar flex gap-3 overflow-x-auto pb-1">
-            <button className="w-20 shrink-0 text-center">
+            <button className="w-20 shrink-0 text-center" type="button">
               <div className="mx-auto grid h-16 w-16 place-items-center rounded-3xl border border-dashed border-primary/40 bg-primary/10 text-primary">
                 <Plus size={20} />
               </div>
               <div className="mt-1 text-[11px] font-semibold">Ajouter</div>
             </button>
 
-            {stories.map((s) => (
-              <StoryItem key={s.id} story={s} />
+            {stories.map((story) => (
+              <StoryItem key={story.id} story={story} />
             ))}
           </div>
         </Card>
 
-        <CreatePostForm onCreated={loadFeed} />
+        <CreatePostForm onCreated={loadPosts} />
 
         {loading ? (
           <div className="space-y-4">
@@ -352,7 +401,7 @@ export default function FeedPage() {
             }
 
             return (
-              <PostCard key={item.id} post={item.post} onChange={loadFeed} />
+              <PostCard key={item.id} post={item.post} onChange={loadPosts} />
             );
           })
         )}
@@ -361,7 +410,8 @@ export default function FeedPage() {
           <Button
             variant="outline"
             className="w-full"
-            onClick={() => setLimit((v) => v + 10)}
+            onClick={() => setLimit((value) => value + PAGE_SIZE)}
+            disabled={refreshing}
           >
             Voir plus de publications
           </Button>
@@ -417,6 +467,7 @@ function NewsCard({ news }: { news: NewsPost }) {
           alt={news.title}
           className="max-h-[360px] w-full object-cover"
           loading="lazy"
+          decoding="async"
         />
       ) : null}
 
@@ -454,15 +505,17 @@ function NewsCard({ news }: { news: NewsPost }) {
             </span>
           </p>
 
-          <a
-            href={news.source_url}
-            target="_blank"
-            rel="noreferrer"
-            className="inline-flex items-center rounded-xl border px-3 py-2 text-xs font-semibold transition hover:bg-accent"
-          >
-            Lire l’article
-            <ExternalLink className="ml-1.5 h-3.5 w-3.5" />
-          </a>
+          {news.source_url ? (
+            <a
+              href={news.source_url}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center rounded-xl border px-3 py-2 text-xs font-semibold transition hover:bg-accent"
+            >
+              Lire l’article
+              <ExternalLink className="ml-1.5 h-3.5 w-3.5" />
+            </a>
+          ) : null}
         </div>
       </div>
     </Card>

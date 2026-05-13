@@ -10,7 +10,12 @@ export default function GroupDetailPage() {
 
   useEffect(() => {
     if (!id) return;
-    supabase.from("groups").select("*").eq("id", id).single().then(({ data }) => setGroup(data as Group));
+    supabase
+  .from("groups")
+  .select("id, name, description, is_private, creator_id, created_at")
+  .eq("id", id)
+  .single()
+  .then(({ data }) => setGroup(data as Group));
   }, [id]);
 
   return (

@@ -1,6 +1,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import {
+  AlertCircle,
   File as FileIcon,
   Image as ImageIcon,
   MessageCircle,
@@ -22,6 +23,9 @@ import { Input } from "@/components/ui/input";
 
 import { timeAgo } from "@/lib/utils";
 
+type MediaType = "text" | "image" | "file" | "audio";
+type LocalStatus = "sending" | "sent" | "failed";
+
 type Message = {
   id: string;
   conversation_id: string;
@@ -30,8 +34,15 @@ type Message = {
   created_at: string;
   is_read: boolean;
   media_url?: string | null;
-  media_type?: "text" | "image" | "file" | "audio" | null;
+  media_type?: MediaType | null;
   file_name?: string | null;
+
+  /**
+   * Champs seulement côté front.
+   * Ils ne doivent pas exister dans Supabase.
+   */
+  local_status?: LocalStatus;
+  local_preview_url?: string | null;
 };
 
 type ProfileMini = {
@@ -49,6 +60,12 @@ type ConversationItem = {
   last_message_content?: string | null;
   last_message_created_at?: string | null;
   last_message_media_type?: string | null;
+
+  /**
+   * Sert à cacher les doublons d’une même personne dans l’interface.
+   * Exemple : 2 conversations différentes avec le même utilisateur.
+   */
+  duplicate_ids?: string[];
 };
 
 type ConversationRpcRow = {
@@ -69,26 +86,102 @@ const MESSAGE_SELECT =
 
 const MAX_MESSAGE_FILE_SIZE = 25 * 1024 * 1024;
 
-function cleanFileName(name: string) {
-  return name.replace(/[^a-zA-Z0-9.\-_]/g, "_");
+function uniqueStrings(values: Array<string | null | undefined>) {
+  return [...new Set(values.filter(Boolean).map(String))];
 }
 
-function getMediaType(file: File): "image" | "audio" | "file" {
-  if (file.type.startsWith("image/")) return "image";
-  if (file.type.startsWith("audio/")) return "audio";
+function cleanFileName(name: string) {
+  const safeName = name.trim() || `fichier-${Date.now()}`;
+  return safeName.replace(/[^a-zA-Z0-9.\-_]/g, "_");
+}
+
+function createTempId() {
+  if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+    return `temp-${crypto.randomUUID()}`;
+  }
+
+  return `temp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function isImageName(value?: string | null) {
+  if (!value) return false;
+
+  return /\.(png|jpe?g|webp|gif|bmp|svg|avif)$/i.test(value.split("?")[0]);
+}
+
+function isAudioName(value?: string | null) {
+  if (!value) return false;
+
+  return /\.(mp3|wav|ogg|webm|m4a|aac)$/i.test(value.split("?")[0]);
+}
+
+function getMediaType(file: File): Exclude<MediaType, "text"> {
+  if (file.type.startsWith("image/") || isImageName(file.name)) return "image";
+  if (file.type.startsWith("audio/") || isAudioName(file.name)) return "audio";
   return "file";
+}
+
+function getRenderedMediaType(message: Message): MediaType {
+  if (message.media_type === "image") return "image";
+  if (message.media_type === "audio") return "audio";
+  if (message.media_type === "file") {
+    if (isImageName(message.file_name) || isImageName(message.media_url)) {
+      return "image";
+    }
+
+    if (isAudioName(message.file_name) || isAudioName(message.media_url)) {
+      return "audio";
+    }
+
+    return "file";
+  }
+
+  if (message.media_url) {
+    if (isImageName(message.file_name) || isImageName(message.media_url)) {
+      return "image";
+    }
+
+    if (isAudioName(message.file_name) || isAudioName(message.media_url)) {
+      return "audio";
+    }
+
+    return "file";
+  }
+
+  return "text";
+}
+
+function shouldShowTextContent(message: Message, renderedMediaType: MediaType) {
+  const text = message.content?.trim();
+
+  if (!text) return false;
+
+  if (renderedMediaType === "image") {
+    return text.toLowerCase() !== "photo" && text !== message.file_name;
+  }
+
+  if (renderedMediaType === "audio") {
+    return text.toLowerCase() !== "message vocal";
+  }
+
+  if (renderedMediaType === "file") {
+    return text !== message.file_name;
+  }
+
+  return true;
 }
 
 function makeTempMessage(params: {
   conversationId: string;
   userId: string;
   content: string;
-  mediaType: "text" | "image" | "file" | "audio";
+  mediaType: MediaType;
   mediaUrl?: string | null;
+  localPreviewUrl?: string | null;
   fileName?: string | null;
 }): Message {
   return {
-    id: `temp-${crypto.randomUUID()}`,
+    id: createTempId(),
     conversation_id: params.conversationId,
     sender_id: params.userId,
     content: params.content,
@@ -97,6 +190,8 @@ function makeTempMessage(params: {
     media_url: params.mediaUrl ?? null,
     media_type: params.mediaType,
     file_name: params.fileName ?? null,
+    local_status: "sending",
+    local_preview_url: params.localPreviewUrl ?? null,
   };
 }
 
@@ -105,6 +200,150 @@ function sortMessages(messages: Message[]) {
     (a, b) =>
       new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
   );
+}
+
+function getConversationDate(conversation: ConversationItem) {
+  return (
+    conversation.last_message_created_at ||
+    conversation.updated_at ||
+    "1970-01-01T00:00:00.000Z"
+  );
+}
+
+function getConversationTimestamp(conversation: ConversationItem) {
+  return new Date(getConversationDate(conversation)).getTime();
+}
+
+function getConversationIds(conversation: ConversationItem) {
+  return uniqueStrings([conversation.id, ...(conversation.duplicate_ids ?? [])]);
+}
+
+function normalizeConversation(conversation: ConversationItem): ConversationItem {
+  return {
+    ...conversation,
+    unread_count: Number(conversation.unread_count ?? 0),
+    duplicate_ids: getConversationIds(conversation),
+  };
+}
+
+function dedupeConversations(items: ConversationItem[]) {
+  const byOtherUser = new Map<string, ConversationItem>();
+
+  for (const rawItem of items) {
+    const item = normalizeConversation(rawItem);
+    const key = item.other?.id ? `user:${item.other.id}` : `conversation:${item.id}`;
+
+    const existing = byOtherUser.get(key);
+
+    if (!existing) {
+      byOtherUser.set(key, item);
+      continue;
+    }
+
+    const existingIds = getConversationIds(existing);
+    const incomingIds = getConversationIds(item);
+    const hasOverlap = incomingIds.some((id) => existingIds.includes(id));
+
+    const latest =
+      getConversationTimestamp(item) >= getConversationTimestamp(existing)
+        ? item
+        : existing;
+
+    const older = latest.id === item.id ? existing : item;
+
+    byOtherUser.set(key, {
+      ...latest,
+      unread_count: hasOverlap
+        ? Math.max(existing.unread_count, item.unread_count)
+        : existing.unread_count + item.unread_count,
+      duplicate_ids: uniqueStrings([...existingIds, ...incomingIds]),
+      other: latest.other ?? older.other,
+    });
+  }
+
+  return [...byOtherUser.values()].sort(
+    (a, b) => getConversationTimestamp(b) - getConversationTimestamp(a)
+  );
+}
+
+function MessageImage({ message }: { message: Message }) {
+  const [imageUrl, setImageUrl] = useState(
+    message.local_preview_url || message.media_url || ""
+  );
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setImageUrl(message.local_preview_url || message.media_url || "");
+    setFailed(false);
+  }, [message.local_preview_url, message.media_url]);
+
+  if (!imageUrl || failed) {
+    return (
+      <div className="flex items-center gap-2 rounded-xl bg-background/70 p-3 text-xs text-muted-foreground">
+        <AlertCircle size={16} />
+        <span>Image indisponible</span>
+      </div>
+    );
+  }
+
+  return (
+    <a href={message.media_url || imageUrl} target="_blank" rel="noreferrer">
+      <img
+        src={imageUrl}
+        alt={message.file_name || "Photo"}
+        loading={message.local_preview_url ? "eager" : "lazy"}
+        decoding="async"
+        onError={() => {
+          if (
+            message.local_preview_url &&
+            message.media_url &&
+            imageUrl !== message.media_url
+          ) {
+            setImageUrl(message.media_url);
+            return;
+          }
+
+          setFailed(true);
+        }}
+        className="block max-h-[420px] w-full max-w-[420px] rounded-2xl object-contain"
+      />
+    </a>
+  );
+}
+
+function MessageAttachment({ message }: { message: Message }) {
+  const renderedMediaType = getRenderedMediaType(message);
+
+  if (renderedMediaType === "image" && message.media_url) {
+    return <MessageImage message={message} />;
+  }
+
+  if (renderedMediaType === "audio" && message.media_url) {
+    return (
+      <audio
+        controls
+        src={message.media_url}
+        preload="metadata"
+        className="w-64 max-w-full"
+      />
+    );
+  }
+
+  if (renderedMediaType === "file" && message.media_url) {
+    return (
+      <a
+        href={message.media_url}
+        target="_blank"
+        rel="noreferrer"
+        className="flex items-center gap-2 rounded-xl bg-background/60 px-3 py-2 text-sm underline"
+      >
+        <FileIcon size={16} />
+        <span className="truncate">{message.file_name || "Fichier"}</span>
+      </a>
+    );
+  }
+
+  return null;
 }
 
 export default function MessagesPage() {
@@ -131,7 +370,10 @@ export default function MessagesPage() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const streamRef = useRef<MediaStream | null>(null);
+
   const loadingConversationsRef = useRef(false);
+  const messagesRequestIdRef = useRef(0);
+  const localObjectUrlsRef = useRef<Set<string>>(new Set());
 
   const conversationCacheKey = useMemo(() => {
     return user ? `social-connect-conversations-${user.id}` : "";
@@ -141,6 +383,19 @@ export default function MessagesPage() {
     selectedProfile?.full_name ||
     selectedProfile?.username ||
     "Conversation";
+
+  function registerObjectUrl(url: string | null) {
+    if (url?.startsWith("blob:")) {
+      localObjectUrlsRef.current.add(url);
+    }
+  }
+
+  function revokeObjectUrl(url?: string | null) {
+    if (!url?.startsWith("blob:")) return;
+
+    URL.revokeObjectURL(url);
+    localObjectUrlsRef.current.delete(url);
+  }
 
   function scrollToBottom(behavior: ScrollBehavior = "auto") {
     requestAnimationFrame(() => {
@@ -162,14 +417,38 @@ export default function MessagesPage() {
 
   function replaceTempMessage(tempId: string, savedMessage: Message) {
     setMessages((previousMessages) => {
+      const tempMessage = previousMessages.find((message) => message.id === tempId);
+
+      revokeObjectUrl(tempMessage?.local_preview_url);
+
       const withoutTempAndDuplicate = previousMessages.filter(
         (message) => message.id !== tempId && message.id !== savedMessage.id
       );
 
-      return sortMessages([...withoutTempAndDuplicate, savedMessage]);
+      return sortMessages([
+        ...withoutTempAndDuplicate,
+        {
+          ...savedMessage,
+          local_status: "sent",
+          local_preview_url: null,
+        },
+      ]);
     });
 
     scrollToBottom("smooth");
+  }
+
+  function markTempMessageFailed(tempId: string) {
+    setMessages((previousMessages) =>
+      previousMessages.map((message) =>
+        message.id === tempId
+          ? {
+              ...message,
+              local_status: "failed",
+            }
+          : message
+      )
+    );
   }
 
   function updateConversationPreview(params: {
@@ -181,23 +460,23 @@ export default function MessagesPage() {
     const updatedAt = params.createdAt ?? new Date().toISOString();
 
     setConversations((previousConversations) =>
-      previousConversations
-        .map((conversation) =>
-          conversation.id === params.targetConversationId
-            ? {
-                ...conversation,
-                updated_at: updatedAt,
-                last_message_content: params.content,
-                last_message_created_at: updatedAt,
-                last_message_media_type: params.mediaType,
-              }
-            : conversation
-        )
-        .sort(
-          (a, b) =>
-            new Date(b.updated_at ?? 0).getTime() -
-            new Date(a.updated_at ?? 0).getTime()
-        )
+      dedupeConversations(
+        previousConversations.map((conversation) => {
+          const ids = getConversationIds(conversation);
+
+          if (!ids.includes(params.targetConversationId)) {
+            return conversation;
+          }
+
+          return {
+            ...conversation,
+            updated_at: updatedAt,
+            last_message_content: params.content,
+            last_message_created_at: updatedAt,
+            last_message_media_type: params.mediaType,
+          };
+        })
+      )
     );
   }
 
@@ -234,7 +513,7 @@ export default function MessagesPage() {
       return;
     }
 
-    const rows = ((data ?? []) as unknown) as ConversationRpcRow[];
+    const rows = (data ?? []) as ConversationRpcRow[];
 
     const nextConversations: ConversationItem[] = rows.map((row) => ({
       id: String(row.id),
@@ -251,14 +530,17 @@ export default function MessagesPage() {
       last_message_content: row.last_message_content,
       last_message_created_at: row.last_message_created_at,
       last_message_media_type: row.last_message_media_type,
+      duplicate_ids: [String(row.id)],
     }));
 
-    setConversations(nextConversations);
+    const cleanConversations = dedupeConversations(nextConversations);
+
+    setConversations(cleanConversations);
 
     if (conversationCacheKey) {
       localStorage.setItem(
         conversationCacheKey,
-        JSON.stringify(nextConversations)
+        JSON.stringify(cleanConversations)
       );
     }
   }, [user?.id, conversationCacheKey]);
@@ -269,6 +551,9 @@ export default function MessagesPage() {
       return;
     }
 
+    const requestId = messagesRequestIdRef.current + 1;
+    messagesRequestIdRef.current = requestId;
+
     setLoadingMessages(true);
 
     const { data, error } = await supabase
@@ -278,6 +563,8 @@ export default function MessagesPage() {
       .order("created_at", { ascending: false })
       .limit(80);
 
+    if (messagesRequestIdRef.current !== requestId) return;
+
     setLoadingMessages(false);
 
     if (error) {
@@ -285,7 +572,7 @@ export default function MessagesPage() {
       return;
     }
 
-    const nextMessages = (((data ?? []) as unknown) as Message[]).reverse();
+    const nextMessages = ((data ?? []) as Message[]).reverse();
 
     setMessages(nextMessages);
     scrollToBottom("auto");
@@ -298,12 +585,28 @@ export default function MessagesPage() {
 
     setConversations((previousConversations) =>
       previousConversations.map((conversation) =>
-        conversation.id === conversationId
+        getConversationIds(conversation).includes(conversationId)
           ? { ...conversation, unread_count: 0 }
           : conversation
       )
     );
   }, [conversationId, user?.id]);
+
+  async function markConversationGroupAsRead(conversation: ConversationItem) {
+    if (!user) return;
+
+    const ids = getConversationIds(conversation);
+
+    await Promise.all(
+      ids.map((id) =>
+        supabase
+          .from("messages")
+          .update({ is_read: true })
+          .eq("conversation_id", id)
+          .neq("sender_id", user.id)
+      )
+    );
+  }
 
   async function openConversation(conversation: ConversationItem) {
     setConversationId(conversation.id);
@@ -311,17 +614,13 @@ export default function MessagesPage() {
 
     setConversations((previousConversations) =>
       previousConversations.map((item) =>
-        item.id === conversation.id ? { ...item, unread_count: 0 } : item
+        getConversationIds(item).includes(conversation.id)
+          ? { ...item, unread_count: 0 }
+          : item
       )
     );
 
-    if (user) {
-      void supabase
-        .from("messages")
-        .update({ is_read: true })
-        .eq("conversation_id", conversation.id)
-        .neq("sender_id", user.id);
-    }
+    void markConversationGroupAsRead(conversation);
   }
 
   async function openOrCreateConversationWith(targetId: string) {
@@ -345,38 +644,68 @@ export default function MessagesPage() {
       return;
     }
 
-    const myConversationIds = [
-      ...new Set(
-        (myParticipants ?? []).map((item) => String(item.conversation_id))
-      ),
-    ];
+    const myConversationIds = uniqueStrings(
+      (myParticipants ?? []).map((item) => item.conversation_id)
+    );
 
     if (myConversationIds.length > 0) {
-      const { data: existingConversations, error: existingError } =
-        await supabase
-          .from("conversation_participants")
-          .select("conversation_id")
-          .in("conversation_id", myConversationIds)
-          .eq("user_id", targetId)
-          .limit(1);
+      const { data: targetParticipants, error: existingError } = await supabase
+        .from("conversation_participants")
+        .select("conversation_id")
+        .in("conversation_id", myConversationIds)
+        .eq("user_id", targetId);
 
       if (existingError) {
         toast.error(existingError.message);
         return;
       }
 
-      if (existingConversations && existingConversations.length > 0) {
-        const existingConversationId = String(
-          existingConversations[0].conversation_id
+      const existingConversationIds = uniqueStrings(
+        (targetParticipants ?? []).map((item) => item.conversation_id)
+      );
+
+      if (existingConversationIds.length > 0) {
+        const { data: conversationRows, error: conversationError } = await supabase
+          .from("conversations")
+          .select("id, updated_at")
+          .in("id", existingConversationIds)
+          .order("updated_at", { ascending: false })
+          .limit(1);
+
+        if (conversationError) {
+          toast.error(conversationError.message);
+          return;
+        }
+
+        const existingConversationId =
+          conversationRows?.[0]?.id || existingConversationIds[0];
+
+        setConversationId(String(existingConversationId));
+
+        await Promise.all(
+          existingConversationIds.map((id) =>
+            supabase
+              .from("messages")
+              .update({ is_read: true })
+              .eq("conversation_id", id)
+              .neq("sender_id", user.id)
+          )
         );
 
-        setConversationId(existingConversationId);
-
-        void supabase
-          .from("messages")
-          .update({ is_read: true })
-          .eq("conversation_id", existingConversationId)
-          .neq("sender_id", user.id);
+        setConversations((previousConversations) =>
+          dedupeConversations(
+            previousConversations.map((conversation) =>
+              conversation.other?.id === targetId
+                ? {
+                    ...conversation,
+                    id: String(existingConversationId),
+                    duplicate_ids: existingConversationIds,
+                    unread_count: 0,
+                  }
+                : conversation
+            )
+          )
+        );
 
         void loadConversations();
         return;
@@ -426,9 +755,10 @@ export default function MessagesPage() {
         last_message_content: null,
         last_message_created_at: null,
         last_message_media_type: null,
+        duplicate_ids: [newConversationId],
       };
 
-      return [nextConversation, ...previousConversations];
+      return dedupeConversations([nextConversation, ...previousConversations]);
     });
 
     void loadConversations();
@@ -447,17 +777,13 @@ export default function MessagesPage() {
       .eq("id", targetConversationId);
 
     setConversations((previousConversations) =>
-      previousConversations
-        .map((conversation) =>
-          conversation.id === targetConversationId
+      dedupeConversations(
+        previousConversations.map((conversation) =>
+          getConversationIds(conversation).includes(targetConversationId)
             ? { ...conversation, updated_at: updatedAt }
             : conversation
         )
-        .sort(
-          (a, b) =>
-            new Date(b.updated_at ?? 0).getTime() -
-            new Date(a.updated_at ?? 0).getTime()
-        )
+      )
     );
   }
 
@@ -478,6 +804,7 @@ export default function MessagesPage() {
     setSending(true);
     setContent("");
     mergeMessage(tempMessage);
+
     updateConversationPreview({
       targetConversationId: conversationId,
       content: messageContent,
@@ -509,7 +836,8 @@ export default function MessagesPage() {
     }
 
     if (data) {
-      const savedMessage = ((data as unknown) as Message);
+      const savedMessage = data as Message;
+
       replaceTempMessage(tempMessage.id, savedMessage);
 
       updateConversationPreview({
@@ -531,7 +859,41 @@ export default function MessagesPage() {
       return;
     }
 
+    const mediaType = getMediaType(file);
+
+    const messageContent =
+      mediaType === "image"
+        ? "Photo"
+        : mediaType === "audio"
+        ? "Message vocal"
+        : file.name;
+
+    const localPreviewUrl =
+      mediaType === "image" || mediaType === "audio"
+        ? URL.createObjectURL(file)
+        : null;
+
+    registerObjectUrl(localPreviewUrl);
+
+    const tempMessage = makeTempMessage({
+      conversationId,
+      userId: user.id,
+      content: messageContent,
+      mediaType,
+      mediaUrl: localPreviewUrl,
+      localPreviewUrl,
+      fileName: file.name,
+    });
+
     setSending(true);
+    mergeMessage(tempMessage);
+
+    updateConversationPreview({
+      targetConversationId: conversationId,
+      content: messageContent,
+      mediaType,
+      createdAt: tempMessage.created_at,
+    });
 
     const safeName = cleanFileName(file.name);
     const path = `messages/${conversationId}/${Date.now()}-${safeName}`;
@@ -546,6 +908,7 @@ export default function MessagesPage() {
 
     if (uploadError) {
       setSending(false);
+      markTempMessageFailed(tempMessage.id);
       toast.error(uploadError.message);
       return;
     }
@@ -554,32 +917,7 @@ export default function MessagesPage() {
       .from("media")
       .getPublicUrl(path);
 
-    const mediaType = getMediaType(file);
-
-    const messageContent =
-      mediaType === "image"
-        ? "Photo"
-        : mediaType === "audio"
-        ? "Message vocal"
-        : file.name;
-
-    const tempMessage = makeTempMessage({
-      conversationId,
-      userId: user.id,
-      content: messageContent,
-      mediaType,
-      mediaUrl: publicUrlData.publicUrl,
-      fileName: file.name,
-    });
-
-    mergeMessage(tempMessage);
-
-    updateConversationPreview({
-      targetConversationId: conversationId,
-      content: messageContent,
-      mediaType,
-      createdAt: tempMessage.created_at,
-    });
+    const publicUrl = publicUrlData.publicUrl;
 
     const { data, error: insertError } = await supabase
       .from("messages")
@@ -587,7 +925,7 @@ export default function MessagesPage() {
         conversation_id: conversationId,
         sender_id: user.id,
         content: messageContent,
-        media_url: publicUrlData.publicUrl,
+        media_url: publicUrl,
         media_type: mediaType,
         file_name: file.name,
         is_read: false,
@@ -598,15 +936,14 @@ export default function MessagesPage() {
     setSending(false);
 
     if (insertError) {
-      setMessages((previousMessages) =>
-        previousMessages.filter((message) => message.id !== tempMessage.id)
-      );
+      markTempMessageFailed(tempMessage.id);
       toast.error(insertError.message);
       return;
     }
 
     if (data) {
-      const savedMessage = ((data as unknown) as Message);
+      const savedMessage = data as Message;
+
       replaceTempMessage(tempMessage.id, savedMessage);
 
       updateConversationPreview({
@@ -744,7 +1081,7 @@ export default function MessagesPage() {
 
       if (cachedConversations) {
         const parsed = JSON.parse(cachedConversations) as ConversationItem[];
-        setConversations(parsed);
+        setConversations(dedupeConversations(parsed));
       }
     } catch {
       localStorage.removeItem(conversationCacheKey);
@@ -782,7 +1119,10 @@ export default function MessagesPage() {
 
           if (!newMessage?.id) return;
 
-          mergeMessage(newMessage);
+          mergeMessage({
+            ...newMessage,
+            local_status: "sent",
+          });
 
           updateConversationPreview({
             targetConversationId: newMessage.conversation_id,
@@ -812,7 +1152,13 @@ export default function MessagesPage() {
 
           setMessages((previousMessages) =>
             previousMessages.map((message) =>
-              message.id === updatedMessage.id ? updatedMessage : message
+              message.id === updatedMessage.id
+                ? {
+                    ...updatedMessage,
+                    local_status: message.local_status ?? "sent",
+                    local_preview_url: message.local_preview_url ?? null,
+                  }
+                : message
             )
           );
         }
@@ -841,7 +1187,10 @@ export default function MessagesPage() {
 
   useEffect(() => {
     if (conversationCacheKey && conversations.length > 0) {
-      localStorage.setItem(conversationCacheKey, JSON.stringify(conversations));
+      localStorage.setItem(
+        conversationCacheKey,
+        JSON.stringify(dedupeConversations(conversations))
+      );
     }
   }, [conversationCacheKey, conversations]);
 
@@ -852,6 +1201,12 @@ export default function MessagesPage() {
   useEffect(() => {
     return () => {
       streamRef.current?.getTracks().forEach((track) => track.stop());
+
+      for (const url of localObjectUrlsRef.current) {
+        URL.revokeObjectURL(url);
+      }
+
+      localObjectUrlsRef.current.clear();
     };
   }, []);
 
@@ -869,17 +1224,17 @@ export default function MessagesPage() {
         </div>
 
         <div className="space-y-2">
-          {conversations.map((conversation) => {
+          {dedupeConversations(conversations).map((conversation) => {
             const otherName =
               conversation.other?.full_name ||
               conversation.other?.username ||
               "Utilisateur";
 
-            const isActive = conversation.id === conversationId;
+            const isActive = getConversationIds(conversation).includes(conversationId);
 
             return (
               <button
-                key={conversation.id}
+                key={`${conversation.other?.id || conversation.id}-${conversation.id}`}
                 type="button"
                 onClick={() => openConversation(conversation)}
                 className={`relative flex w-full items-center gap-3 rounded-2xl p-3 text-left transition ${
@@ -999,6 +1354,10 @@ export default function MessagesPage() {
           {!loadingMessages &&
             messages.map((message) => {
               const isMine = message.sender_id === user?.id;
+              const renderedMediaType = getRenderedMediaType(message);
+              const hasAttachment = renderedMediaType !== "text" && !!message.media_url;
+              const showText = shouldShowTextContent(message, renderedMediaType);
+              const isImageBubble = renderedMediaType === "image" && !!message.media_url;
 
               return (
                 <div
@@ -1006,57 +1365,45 @@ export default function MessagesPage() {
                   className={`flex ${isMine ? "justify-end" : "justify-start"}`}
                 >
                   <div
-                    className={`max-w-[78%] rounded-2xl px-4 py-2 text-sm ${
+                    className={`max-w-[82%] overflow-hidden rounded-2xl text-sm shadow-sm ${
+                      isImageBubble ? "p-1" : "px-4 py-2"
+                    } ${
                       isMine
                         ? "bg-primary text-primary-foreground"
                         : "bg-muted text-foreground"
                     }`}
                   >
-                    {message.media_type === "image" && message.media_url && (
-                      <a
-                        href={message.media_url}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        <img
-                          src={message.media_url}
-                          alt={message.file_name || "Image"}
-                          loading="lazy"
-                          decoding="async"
-                          className="mb-2 max-h-80 rounded-xl object-contain"
-                        />
-                      </a>
+                    {hasAttachment && (
+                      <div className={showText ? "mb-2" : ""}>
+                        <MessageAttachment message={message} />
+                      </div>
                     )}
 
-                    {message.media_type === "audio" && message.media_url && (
-                      <audio
-                        controls
-                        src={message.media_url}
-                        preload="metadata"
-                        className="mb-2"
-                      />
-                    )}
-
-                    {message.media_type === "file" && message.media_url && (
-                      <a
-                        href={message.media_url}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="mb-2 flex items-center gap-2 underline"
-                      >
-                        <FileIcon size={16} />
-                        {message.file_name || "Fichier"}
-                      </a>
-                    )}
-
-                    {message.content && (
+                    {showText && (
                       <div className="whitespace-pre-wrap break-words">
                         {message.content}
                       </div>
                     )}
 
-                    <div className="mt-1 text-[10px] opacity-70">
-                      {timeAgo(message.created_at)}
+                    <div
+                      className={`mt-1 flex items-center justify-end gap-1 text-[10px] opacity-70 ${
+                        isImageBubble ? "px-2 pb-1" : ""
+                      }`}
+                    >
+                      {message.local_status === "sending" && (
+                        <span>Envoi...</span>
+                      )}
+
+                      {message.local_status === "failed" && (
+                        <span className="font-semibold">
+                          Échec de l’envoi
+                        </span>
+                      )}
+
+                      {message.local_status !== "sending" &&
+                        message.local_status !== "failed" && (
+                          <span>{timeAgo(message.created_at)}</span>
+                        )}
                     </div>
                   </div>
                 </div>

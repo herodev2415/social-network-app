@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 220 45% 98%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --primary: 244 78% 59%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 226 100% 97%;
+    --secondary-foreground: 226 56% 20%;
+    --accent: 226 100% 96%;
+    --accent-foreground: 244 78% 40%;
+    --muted: 220 28% 95%;
+    --muted-foreground: 220 10% 44%;
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 20% 88%;
+    --input: 220 20% 88%;
+    --ring: 244 78% 59%;
+    --radius: 1rem;
+  }
+
+  .dark {
+    --background: 222 47% 6%;
+    --foreground: 210 40% 98%;
+    --card: 224 38% 10%;
+    --card-foreground: 210 40% 98%;
+    --primary: 252 95% 70%;
+    --primary-foreground: 222 47% 9%;
+    --secondary: 223 32% 16%;
+    --secondary-foreground: 210 40% 98%;
+    --accent: 224 36% 18%;
+    --accent-foreground: 252 95% 78%;
+    --muted: 224 32% 15%;
+    --muted-foreground: 215 20% 72%;
+    --destructive: 0 62% 35%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 224 28% 20%;
+    --input: 224 28% 20%;
+    --ring: 252 95% 70%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply min-h-screen bg-background text-foreground antialiased;
+    background-image:
+      radial-gradient(circle at top left, hsl(var(--primary) / 0.14), transparent 32rem),
+      radial-gradient(circle at top right, rgb(236 72 153 / 0.10), transparent 28rem),
+      linear-gradient(180deg, hsl(var(--background)), hsl(var(--muted) / 0.65));
+  }
+
+  a,
+  button,
+  input,
+  textarea {
+    @apply outline-none;
+  }
+}
+
+@layer components {
+  .app-shell {
+    @apply min-h-screen;
+  }
+
+  .glass-panel {
+    @apply border border-white/60 bg-white/80 shadow-[0_18px_60px_-35px_rgba(15,23,42,0.55)] backdrop-blur-xl dark:border-white/10 dark:bg-card/70;
+  }
+
+  .soft-card {
+    @apply rounded-2xl border bg-card/95 shadow-[0_14px_45px_-32px_rgba(15,23,42,0.75)] transition-all duration-200 hover:shadow-[0_22px_60px_-35px_rgba(15,23,42,0.85)];
+  }
+
+  .icon-pill {
+    @apply inline-flex items-center justify-center rounded-full bg-primary/10 text-primary;
+  }
+
+  .section-title {
+    @apply text-sm font-bold tracking-tight text-foreground;
+  }
+}
+
+@layer utilities {
+  .gradient-text {
+    background: linear-gradient(135deg, hsl(var(--primary)), #ec4899);
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .gradient-brand {
+    background: linear-gradient(135deg, #4f46e5, #7c3aed 46%, #ec4899);
+  }
+
+  .custom-scrollbar::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .custom-scrollbar::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.25);
+    border-radius: 999px;
+  }
+}

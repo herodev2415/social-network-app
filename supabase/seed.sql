@@ -1,0 +1,2 @@
+-- Données de démonstration à adapter après création d'utilisateurs réels.
+-- Les tables principales dépendent de auth.users. Crée d'abord des comptes via l'app.
